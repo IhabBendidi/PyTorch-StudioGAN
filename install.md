@@ -19,9 +19,9 @@ pip3 install dist/bioval-0.1.0.tar.gz
 
 Go to your profile on Wandb and extract your personal_API_KEY
 
-```
+```bash
 wandb login PERSONAL_API_KEY
-
+```
 
 
 Running a training session. All results are logged into wandb
