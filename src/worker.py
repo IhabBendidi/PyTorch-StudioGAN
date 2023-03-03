@@ -11,6 +11,7 @@ import random
 import string
 import pickle
 import copy
+import time
 
 from torch.nn import DataParallel
 from torch.nn.parallel import DistributedDataParallel
@@ -43,6 +44,8 @@ import utils.ops as ops
 import utils.resize as resize
 import utils.apa_aug as apa_aug
 import wandb
+from bioval.metrics.conditional_evaluation import ConditionalEvaluation
+
 
 SAVE_FORMAT = "step={step:0>3}-Inception_mean={Inception_mean:<.4}-Inception_std={Inception_std:<.4}-FID={FID:<.5}.pth"
 
@@ -182,7 +185,19 @@ class WORKER(object):
                        name=self.run_name,
                        dir=self.RUN.save_dir,
                        resume=self.best_step > 0 and resume)
-
+            
+            _ , _ ,real_acts = fid.calculate_moments(data_loader=self.eval_dataloader,
+                                   eval_model=self.eval_model,
+                                   num_generate="N/A",
+                                   batch_size=self.cfgs.OPTIMIZATION.batch_size,
+                                   quantize=True,
+                                   world_size=self.cfgs.OPTIMIZATION.world_size,
+                                   DDP=self.cfgs.RUN.distributed_data_parallel,
+                                   disable_tqdm=self.global_rank != 0,
+                                   fake_feats=None)
+            self.real_vector = real_acts
+            
+            
         self.start_time = datetime.now()
 
     def prepare_train_iter(self, epoch_counter):
@@ -839,7 +854,46 @@ class WORKER(object):
                                                                    device=self.local_rank,
                                                                    logger=self.logger,
                                                                    disable_tqdm=self.global_rank != 0)
+            #print("fake_feats.shape: ", fake_feats.shape) # fake_feats.shape:  torch.Size([50048, 2048]) for Cifar10
+            #print("fake_probs.shape: ", fake_probs.shape) # fake_probs.shape:  torch.Size([50048, 1008]) for Cifar10
+            #print("fake_labels length: ", len(fake_labels)) # 50048 for Cifar10
+            #print("set of fake_labels: ", set(fake_labels)) # set of fake_labels:  {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
 
+
+            # Get the set of unique labels
+            unique_labels = set(fake_labels)
+
+            # Determine the minimum number of instances per class
+            min_instances = min([(fake_labels == label).sum().item() for label in unique_labels])
+
+            # Create the new vector
+            fake_vector = torch.zeros(len(unique_labels), min_instances, fake_feats.shape[1])
+            for i, label in enumerate(unique_labels):
+                instances = fake_feats[fake_labels == label][:min_instances]
+                fake_vector[i] = instances
+            
+            #print("fake_vector.shape: ", fake_vector.shape) # fake_vector.shape:  torch.Size([10, 4882, 2048]) for Cifar10
+
+            #print("Number of batches in reak data: ",len(self.eval_dataloader)) # 782
+
+            #print("Real data full size: ",len(self.eval_dataloader.dataset)) # 50000 for Cifar10
+
+            #batch = next(iter(self.eval_dataloader))
+            #num_columns = batch[0].shape[1]
+            #print("Real data columns : ", num_columns) # 3 for Cifar10
+
+            #print("general batch info :",batch[0].shape) # torch.Size([64, 3, 32, 32]) for Cifar10
+            #print("general batch info :",batch[1].shape) # torch.Size([64]) for Cifar10, probably the labels of images
+
+
+            # Explore the type of each of the three values of the batch
+            #print("type of batch[0] : ",type(batch[0])) # type of batch[0] :  <class 'torch.Tensor'
+            #print("type of batch[1] : ",type(batch[1])) # type of batch[1] :  <class 'torch.Tensor'>
+            #print("type of batch[2] : ",type(batch[2])) # Error index our of range
+
+
+
+            
             if ("fid" in metrics or "prdc" in metrics) and self.global_rank == 0:
                 self.logger.info("{num_images} real images is used for evaluation.".format(num_images=len(self.eval_dataloader.dataset)))
 
@@ -867,7 +921,7 @@ class WORKER(object):
                             wandb.log({"{eval_model} Top5 acc".format(eval_model=self.RUN.eval_backbone): top5}, step=self.wandb_step)
 
             if "fid" in metrics:
-                fid_score, m1, c1 = fid.calculate_fid(data_loader=self.eval_dataloader,
+                fid_score, m1, c1, real_vector = fid.calculate_fid(data_loader=self.eval_dataloader,
                                                       eval_model=self.eval_model,
                                                       num_generate=self.num_eval[self.RUN.ref_dataset],
                                                       cfgs=self.cfgs,
@@ -875,6 +929,26 @@ class WORKER(object):
                                                       pre_cal_std=self.sigma,
                                                       fake_feats=fake_feats,
                                                       disable_tqdm=self.global_rank != 0)
+                if real_vector is not None:
+                    self.real_vector = real_vector
+                
+                # compute time needed for operation
+                #start_time = time.time()
+                
+                topk = ConditionalEvaluation()
+                bioval_metrics = topk(self.real_vector, fake_vector,k_range=[1, 5])
+
+                # spliit real_vector into two parts with total number of classes but half the number of images per class
+                real_vector_1 = self.real_vector[:, :int(self.real_vector.shape[1]/2), :]
+                real_vector_2 = self.real_vector[:, int(self.real_vector.shape[1]/2):, :]
+
+                tests = topk(real_vector_1, real_vector_2, k_range=[1, 5])
+                
+
+                # compute time needed for operation and print it
+                #print("Time elapsed: {:.2f}s".format(time.time() - start_time)) # Time elapsed: 0.79s for Cifar10
+                
+                # shape of real_vector is (10, 5000, 2048) for Cifar10
                 if self.global_rank == 0:
                     self.logger.info("FID score (Step: {step}, Using {type} moments): {FID}".format(
                         step=step, type=self.RUN.ref_dataset, FID=fid_score))
@@ -883,9 +957,18 @@ class WORKER(object):
                     metric_dict.update({"FID": fid_score})
                     if writing:
                         wandb.log({"FID score": fid_score}, step=self.wandb_step)
+                        wandb.log({"intra_top1": bioval_metrics["intra_top1"]}, step=self.wandb_step)
+                        wandb.log({"intra_top5": bioval_metrics["intra_top5"]}, step=self.wandb_step)
+                        wandb.log({"inter_corr": bioval_metrics["inter_corr"]}, step=self.wandb_step)
+                        wandb.log({"inter_p": bioval_metrics["inter_p"]}, step=self.wandb_step)
+                        wandb.log({"exact_matching": bioval_metrics["exact_matching"]}, step=self.wandb_step)
+                        wandb.log({"val_intra_top1": tests["intra_top1"]}, step=self.wandb_step)
+                        wandb.log({"val_intra_top5": tests["intra_top5"]}, step=self.wandb_step)
                     if training:
                         self.logger.info("Best FID score (Step: {step}, Using {type} moments): {FID}".format(
                             step=self.best_step, type=self.RUN.ref_dataset, FID=self.best_fid))
+            
+
 
             if "prdc" in metrics:
                 prc, rec, dns, cvg = prdc.calculate_pr_dc(real_feats=self.real_feats,
@@ -1402,7 +1485,7 @@ class WORKER(object):
                                                          pin_memory=True,
                                                          drop_last=False)
 
-                mu, sigma = fid.calculate_moments(data_loader=dataloader,
+                mu, sigma, _ = fid.calculate_moments(data_loader=dataloader,
                                                   eval_model=self.eval_model,
                                                   num_generate="N/A",
                                                   batch_size=batch_size,
@@ -1436,7 +1519,7 @@ class WORKER(object):
                                                     logger=self.logger,
                                                     disable_tqdm=True)
 
-                ifid_score, _, _ = fid.calculate_fid(data_loader="N/A",
+                ifid_score, _, _, _ = fid.calculate_fid(data_loader="N/A",
                                                      eval_model=self.eval_model,
                                                      num_generate=num_samples,
                                                      cfgs=self.cfgs,
