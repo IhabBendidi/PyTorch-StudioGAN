@@ -7,6 +7,8 @@ git clone --recurse-submodules git@github.com:IhabBendidi/PyTorch-StudioGAN.git
 ## Installation 
 
 ````
+pip3 install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
+pip3 install tqdm ninja h5py kornia matplotlib pandas sklearn scipy seaborn wandb PyYaml click requests pyspng imageio-ffmpeg timm
 pip3 install -r requirements.txt
 cd bioval
 poetry build
